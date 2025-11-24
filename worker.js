@@ -19,6 +19,7 @@ let cp = '';
 let ev = true;   
 let et = false; 
 let ex = false;
+let es = false;  // shadowsocks-ws-tls 协议控制
 let tp = '';  
 
 let scu = 'https://url.v1.mk/sub';  
@@ -435,6 +436,11 @@ export default {
             const xhttpControl = getConfigValue('ex', env.ex);
             if (xhttpControl !== undefined && xhttpControl !== '') {
                 ex = xhttpControl === 'yes' || xhttpControl === true || xhttpControl === 'true';
+            }
+            
+            const shadowsocksControl = getConfigValue('es', env.es);
+            if (shadowsocksControl !== undefined && shadowsocksControl !== '') {
+                es = shadowsocksControl === 'yes' || shadowsocksControl === true || shadowsocksControl === 'true';
             }
             
             scu = getConfigValue('scu', env.scu) || 'https://url.v1.mk/sub';
@@ -1353,6 +1359,9 @@ async function handleSubscriptionRequest(request, user, url = null) {
         if (ex) {
             finalLinks.push(...generateXhttpLinksFromSource(list, user, workerDomain));
         }
+        if (es) {
+            finalLinks.push(...generateShadowsocksLinksFromSource(list, user, workerDomain));
+        }
     }
 
     if (currentWorkerRegion === 'CUSTOM') {
@@ -1434,6 +1443,9 @@ async function handleSubscriptionRequest(request, user, url = null) {
                     }
                     if (et) {
                         finalLinks.push(...await generateTrojanLinksFromNewIPs(newIPList, user, workerDomain));
+                    }
+                    if (es) {
+                        finalLinks.push(...generateShadowsocksLinksFromNewIPs(newIPList, user, workerDomain));
                     }
             }
         } catch (error) {
@@ -1764,6 +1776,23 @@ async function handleWsRequest(request) {
             }
             
             if (!protocolType) {
+                // 优先检测 shadowsocks 协议（因为它的数据包最小，可能与其他协议冲突）
+                if (es && chunk.byteLength >= 7) {
+                    const ssResult = parseSSPacketHeader(chunk);
+                    if (!ssResult.hasError) {
+                        protocolType = 'shadowsocks';
+                        const { addressType, port, hostname, rawIndex } = ssResult;
+                        if (addressType === 2) {
+                            if (port === 53) isDnsQuery = true;
+                            else throw new Error(E_UDP_DNS_ONLY);
+                        }
+                        const rawData = chunk.slice(rawIndex);
+                        if (isDnsQuery) return forwardUDP(rawData, serverSock, null);
+                        // shadowsocks 协议总是使用 SOCKS5 代理（如果配置了的话）用于出站所有流量
+                        await forwardTCPWithSocks(addressType, hostname, port, rawData, serverSock, null, remoteConnWrapper);
+                        return;
+                    }
+                }
                 
                 if (ev && chunk.byteLength >= 24) {
                     const vlessResult = parseWsPacketHeader(chunk, at);
@@ -1863,6 +1892,73 @@ async function forwardTCP(addrType, host, portNum, rawData, ws, respHeader, remo
     
     try {
         const initialSocket = await connectAndSend(host, portNum, enableSocksDowngrade ? false : isSocksEnabled);
+        remoteConnWrapper.socket = initialSocket;
+        connectStreams(initialSocket, ws, respHeader, retryConnection);
+    } catch (err) {
+        retryConnection();
+    }
+}
+
+async function forwardTCPWithSocks(addrType, host, portNum, rawData, ws, respHeader, remoteConnWrapper) {
+    // shadowsocks 协议专用：总是使用 SOCKS5 代理（如果配置了的话）用于出站所有流量
+    // 将 shadowsocks 地址类型映射到 VLESS/Trojan 地址类型
+    // shadowsocks: 1=IPv4, 3=Domain, 4=IPv6
+    // VLESS/Trojan: ADDRESS_TYPE_IPV4=1, ADDRESS_TYPE_URL=2, ADDRESS_TYPE_IPV6=3
+    let mappedAddrType = addrType;
+    if (addrType === 3) {
+        mappedAddrType = ADDRESS_TYPE_URL; // Domain
+    } else if (addrType === 4) {
+        mappedAddrType = ADDRESS_TYPE_IPV6; // IPv6
+    } else if (addrType === 1) {
+        mappedAddrType = ADDRESS_TYPE_IPV4; // IPv4
+    }
+    
+    async function connectAndSend(address, port, useSocks = false) {
+        const remoteSock = useSocks ?
+            await establishSocksConnection(mappedAddrType, address, port) :
+            connect({ hostname: address, port: port });
+        const writer = remoteSock.writable.getWriter();
+        await writer.write(rawData);
+        writer.releaseLock();
+        return remoteSock;
+    }
+    
+    async function retryConnection() {
+        // 如果配置了 SOCKS5，优先使用 SOCKS5
+        if (isSocksEnabled) {
+            try {
+                const socksSocket = await connectAndSend(host, portNum, true);
+                remoteConnWrapper.socket = socksSocket;
+                socksSocket.closed.catch(() => {}).finally(() => closeSocketQuietly(ws));
+                connectStreams(socksSocket, ws, respHeader, null);
+                return;
+            } catch (socksErr) {
+                // SOCKS5 失败，尝试直接连接
+                try {
+                    const directSocket = await connectAndSend(host, portNum, false);
+                    remoteConnWrapper.socket = directSocket;
+                    directSocket.closed.catch(() => {}).finally(() => closeSocketQuietly(ws));
+                    connectStreams(directSocket, ws, respHeader, null);
+                } catch (directErr) {
+                    closeSocketQuietly(ws);
+                }
+            }
+        } else {
+            // 没有配置 SOCKS5，直接连接
+            try {
+                const directSocket = await connectAndSend(host, portNum, false);
+                remoteConnWrapper.socket = directSocket;
+                directSocket.closed.catch(() => {}).finally(() => closeSocketQuietly(ws));
+                connectStreams(directSocket, ws, respHeader, null);
+            } catch (directErr) {
+                closeSocketQuietly(ws);
+            }
+        }
+    }
+    
+    try {
+        // shadowsocks 协议：如果配置了 SOCKS5，优先使用 SOCKS5；否则直接连接
+        const initialSocket = await connectAndSend(host, portNum, isSocksEnabled);
         remoteConnWrapper.socket = initialSocket;
         connectStreams(initialSocket, ws, respHeader, retryConnection);
     } catch (err) {
@@ -2033,6 +2129,7 @@ async function handleSubscriptionPage(request, user = null) {
                 enableVLESS: '启用 VLESS 协议',
                 enableTrojan: '启用 Trojan 协议',
                 enableXhttp: '启用 xhttp 协议',
+                enableShadowsocks: '启用 Shadowsocks-WS-TLS 协议',
                 trojanPassword: 'Trojan 密码 (可选):',
                 customPath: '自定义路径 (d):',
                 customIP: '自定义ProxyIP (p):',
@@ -2066,7 +2163,7 @@ async function handleSubscriptionPage(request, user = null) {
                 autoSubscriptionCopied: '自动识别订阅链接已复制，客户端访问时会根据User-Agent自动识别并返回对应格式',
                 trojanPasswordPlaceholder: '留空则自动使用 UUID',
                 trojanPasswordHint: '设置自定义 Trojan 密码。留空则使用 UUID。客户端会自动对密码进行 SHA224 哈希。',
-                protocolHint: '可以同时启用多个协议。订阅将生成选中协议的节点。<br>• VLESS WS: 基于 WebSocket 的标准协议<br>• Trojan: 使用 SHA224 密码认证<br>• xhttp: 基于 HTTP POST 的伪装协议（需要绑定自定义域名并开启 gRPC）',
+                protocolHint: '可以同时启用多个协议。订阅将生成选中协议的节点。<br>• VLESS WS: 基于 WebSocket 的标准协议<br>• Trojan: 使用 SHA224 密码认证<br>• xhttp: 基于 HTTP POST 的伪装协议（需要绑定自定义域名并开启 gRPC）<br>• Shadowsocks-WS-TLS: 基于 WebSocket + TLS 的 Shadowsocks 协议（兼容 v2rayN 7.16.4、Xray-core 25.10.15、sing-box 1.12.12）',
                 saveProtocol: '保存协议配置',
                 subscriptionConverterPlaceholder: '默认: https://url.v1.mk/sub',
                 subscriptionConverterHint: '自定义订阅转换API地址，留空则使用默认地址',
@@ -2381,6 +2478,12 @@ async function handleSubscriptionPage(request, user = null) {
                                 <label style="display: inline-flex; align-items: center; cursor: pointer; color: #ffffff; -webkit-font-smoothing: subpixel-antialiased; -moz-osx-font-smoothing: auto; text-rendering: geometricPrecision; text-shadow: none; opacity: 1;">
                                     <input type="checkbox" id="ex" style="margin-right: 8px; width: 18px; height: 18px; cursor: pointer;">
                                         <span style="font-size: 1.1rem; color: #ffffff; -webkit-font-smoothing: subpixel-antialiased; -moz-osx-font-smoothing: auto; text-rendering: geometricPrecision; text-shadow: none; opacity: 1;">${t.enableXhttp}</span>
+                                </label>
+                            </div>
+                            <div style="margin-bottom: 10px;">
+                                <label style="display: inline-flex; align-items: center; cursor: pointer; color: #ffffff; -webkit-font-smoothing: subpixel-antialiased; -moz-osx-font-smoothing: auto; text-rendering: geometricPrecision; text-shadow: none; opacity: 1;">
+                                    <input type="checkbox" id="es" style="margin-right: 8px; width: 18px; height: 18px; cursor: pointer;">
+                                        <span style="font-size: 1.1rem; color: #ffffff; -webkit-font-smoothing: subpixel-antialiased; -moz-osx-font-smoothing: auto; text-rendering: geometricPrecision; text-shadow: none; opacity: 1;">${t.enableShadowsocks}</span>
                                 </label>
                             </div>
                             <div style="margin-top: 15px; padding-top: 15px; border-top: 1px solid transparent;">
@@ -3087,6 +3190,7 @@ async function handleSubscriptionPage(request, user = null) {
                 document.getElementById('ev').checked = config.ev !== 'no';
                 document.getElementById('et').checked = config.et === 'yes';
                 document.getElementById('ex').checked = config.ex === 'yes';
+                document.getElementById('es').checked = config.es === 'yes';
                 document.getElementById('tp').value = config.tp || '';
                 document.getElementById('scu').value = config.scu || '';
                 document.getElementById('epd').checked = config.epd !== 'no';
@@ -3325,12 +3429,14 @@ async function handleSubscriptionPage(request, user = null) {
                         ev: document.getElementById('ev').checked ? 'yes' : 'no', 
                         et: document.getElementById('et').checked ? 'yes' : 'no', 
                         ex: document.getElementById('ex').checked ? 'yes' : 'no',
+                        es: document.getElementById('es').checked ? 'yes' : 'no',
                         tp: document.getElementById('tp').value
                     };
                     
                     if (!document.getElementById('ev').checked && 
                         !document.getElementById('et').checked && 
-                        !document.getElementById('ex').checked) {
+                        !document.getElementById('ex').checked &&
+                        !document.getElementById('es').checked) {
                         alert('至少需要启用一个协议！');
                         return;
                     }
@@ -3343,7 +3449,7 @@ async function handleSubscriptionPage(request, user = null) {
             if (otherConfigForm) {
                 otherConfigForm.addEventListener('submit', async function(e) {
                     e.preventDefault();
-                    const configData = { ev: document.getElementById('ev').checked ? 'yes' : 'no', et: document.getElementById('et').checked ? 'yes' : 'no', ex: document.getElementById('ex').checked ? 'yes' : 'no', tp: document.getElementById('tp').value,
+                    const configData = { ev: document.getElementById('ev').checked ? 'yes' : 'no', et: document.getElementById('et').checked ? 'yes' : 'no', ex: document.getElementById('ex').checked ? 'yes' : 'no', es: document.getElementById('es').checked ? 'yes' : 'no', tp: document.getElementById('tp').value,
                         d: document.getElementById('customPath').value,
                         p: document.getElementById('customIP').value,
                         yx: document.getElementById('preferredIPs').value,
@@ -3356,7 +3462,8 @@ async function handleSubscriptionPage(request, user = null) {
                     // 确保至少选择一个协议
                     if (!document.getElementById('ev').checked && 
                         !document.getElementById('et').checked && 
-                        !document.getElementById('ex').checked) {
+                        !document.getElementById('ex').checked &&
+                        !document.getElementById('es').checked) {
                         alert('至少需要启用一个协议！');
                         return;
                     }
@@ -3492,6 +3599,46 @@ async function parseTrojanHeader(buffer, ut) {
         hostname: address,
         rawClientData: socks5DataBuffer.slice(portIndex + 4)
     };
+}
+
+function parseSSPacketHeader(chunk) {
+    if (chunk.byteLength < 7) return { hasError: true, message: 'Invalid data' };
+    try {
+        const view = new Uint8Array(chunk);
+        const addressType = view[0];
+        let addrIdx = 1, addrLen = 0, addrValIdx = addrIdx, hostname = '';
+        switch (addressType) {
+            case 1: // IPv4
+                addrLen = 4; 
+                hostname = new Uint8Array(chunk.slice(addrValIdx, addrValIdx + addrLen)).join('.'); 
+                addrValIdx += addrLen;
+                break;
+            case 3: // Domain
+                addrLen = view[addrIdx];
+                addrValIdx += 1; 
+                hostname = new TextDecoder().decode(chunk.slice(addrValIdx, addrValIdx + addrLen)); 
+                addrValIdx += addrLen;
+                break;
+            case 4: // IPv6
+                addrLen = 16; 
+                const ipv6Bytes = new Uint8Array(chunk.slice(addrValIdx, addrValIdx + addrLen));
+                const ipv6Parts = [];
+                for (let i = 0; i < 8; i++) {
+                    const part = (ipv6Bytes[i * 2] << 8) | ipv6Bytes[i * 2 + 1];
+                    ipv6Parts.push(part.toString(16));
+                }
+                hostname = ipv6Parts.join(':'); 
+                addrValIdx += addrLen;
+                break;
+            default: 
+                return { hasError: true, message: `Invalid address type: ${addressType}` };
+        }
+        if (!hostname) return { hasError: true, message: `Invalid address: ${addressType}` };
+        const port = new DataView(chunk.slice(addrValIdx, addrValIdx + 2)).getUint16(0);
+        return { hasError: false, addressType, port, hostname, rawIndex: addrValIdx + 2 };
+    } catch (e) {
+        return { hasError: true, message: 'Failed to parse SS packet header' };
+    }
 }
 
 async function sha224Hash(text) {
@@ -4113,6 +4260,70 @@ function generateXhttpLinksFromSource(list, user, workerDomain) {
     return links;
 }
 
+function generateShadowsocksLinksFromSource(list, user, workerDomain) {
+    const CF_HTTP_PORTS = [80, 8080, 8880, 2052, 2082, 2086, 2095];
+    const CF_HTTPS_PORTS = [443, 2053, 2083, 2087, 2096, 8443];
+    
+    const defaultHttpsPorts = [443];
+    const defaultHttpPorts = disableNonTLS ? [] : [80];
+    const links = [];
+    // 使用 UUID 作为路径，格式：/UUID/?ed=2048
+    const wsPath = `/${user}/?ed=2048`;
+    const method = 'none';  // shadowsocks 加密方法
+    
+    list.forEach(item => {
+        let nodeNameBase = item.isp.replace(/\s/g, '_');
+        if (item.colo && item.colo.trim()) {
+            nodeNameBase = `${nodeNameBase}-${item.colo.trim()}`;
+        }
+        const safeIP = item.ip.includes(':') ? `[${item.ip}]` : item.ip;
+        
+        let portsToGenerate = [];
+        
+        if (item.port) {
+            const port = item.port;
+            
+            if (CF_HTTPS_PORTS.includes(port)) {
+                portsToGenerate.push({ port: port, tls: true });
+            } else if (CF_HTTP_PORTS.includes(port)) {
+                if (!disableNonTLS) {
+                    portsToGenerate.push({ port: port, tls: false });
+                }
+            } else {
+                portsToGenerate.push({ port: port, tls: true });
+            }
+        } else {
+            defaultHttpsPorts.forEach(port => {
+                portsToGenerate.push({ port: port, tls: true });
+            });
+            defaultHttpPorts.forEach(port => {
+                portsToGenerate.push({ port: port, tls: false });
+            });
+        }
+
+        portsToGenerate.forEach(({ port, tls }) => {
+            if (tls) {
+                // shadowsocks-ws-tls 标准格式，兼容 v2rayN 7.16.4、Xray-core 25.10.15、sing-box 1.12.12
+                const wsNodeName = `${nodeNameBase}-${port}-SS-WS-TLS`;
+                const ssConfig = `${method}:${user}`;
+                const encodedConfig = btoa(ssConfig);
+                // 使用标准格式：v2ray-plugin;mode=websocket;host=domain;path=/path;tls;sni=domain;skip-cert-verify=true
+                const pluginParams = `v2ray-plugin;mode=websocket;host=${workerDomain};path=${encodeURIComponent(wsPath)};tls;sni=${workerDomain};skip-cert-verify=true`;
+                links.push(`ss://${encodedConfig}@${safeIP}:${port}?plugin=${encodeURIComponent(pluginParams)}#${encodeURIComponent(wsNodeName)}`);
+            } else {
+                // shadowsocks-ws (非TLS)
+                const wsNodeName = `${nodeNameBase}-${port}-SS-WS`;
+                const ssConfig = `${method}:${user}`;
+                const encodedConfig = btoa(ssConfig);
+                const pluginParams = `v2ray-plugin;mode=websocket;host=${workerDomain};path=${encodeURIComponent(wsPath)}`;
+                links.push(`ss://${encodedConfig}@${safeIP}:${port}?plugin=${encodeURIComponent(pluginParams)}#${encodeURIComponent(wsNodeName)}`);
+            }
+        });
+    });
+    
+    return links;
+}
+
 function generateSocks5LinksFromSource(list, user, workerDomain) {
     const CF_HTTP_PORTS = [80, 8080, 8880, 2052, 2082, 2086, 2095];
     const CF_HTTPS_PORTS = [443, 2053, 2083, 2087, 2096, 8443];
@@ -4197,6 +4408,50 @@ async function generateTrojanLinksFromNewIPs(list, user, workerDomain) {
             links.push(link);
         }
     });
+    return links;
+}
+
+function generateShadowsocksLinksFromNewIPs(list, user, workerDomain) {
+    const CF_HTTP_PORTS = [80, 8080, 8880, 2052, 2082, 2086, 2095];
+    const CF_HTTPS_PORTS = [443, 2053, 2083, 2087, 2096, 8443];
+    
+    const links = [];
+    // 使用 UUID 作为路径，格式：/UUID/?ed=2048
+    const wsPath = `/${user}/?ed=2048`;
+    const method = 'none';  // shadowsocks 加密方法
+    
+    list.forEach(item => {
+        const nodeName = item.name.replace(/\s/g, '_');
+        const port = item.port;
+        
+        if (CF_HTTPS_PORTS.includes(port)) {
+            // shadowsocks-ws-tls 标准格式
+            const wsNodeName = `${nodeName}-${port}-SS-WS-TLS`;
+            const ssConfig = `${method}:${user}`;
+            const encodedConfig = btoa(ssConfig);
+            const pluginParams = `v2ray-plugin;mode=websocket;host=${workerDomain};path=${encodeURIComponent(wsPath)};tls;sni=${workerDomain};skip-cert-verify=true`;
+            const link = `ss://${encodedConfig}@${item.ip}:${port}?plugin=${encodeURIComponent(pluginParams)}#${encodeURIComponent(wsNodeName)}`;
+            links.push(link);
+        } else if (CF_HTTP_PORTS.includes(port)) {
+            if (!disableNonTLS) {
+                const wsNodeName = `${nodeName}-${port}-SS-WS`;
+                const ssConfig = `${method}:${user}`;
+                const encodedConfig = btoa(ssConfig);
+                const pluginParams = `v2ray-plugin;mode=websocket;host=${workerDomain};path=${encodeURIComponent(wsPath)}`;
+                const link = `ss://${encodedConfig}@${item.ip}:${port}?plugin=${encodeURIComponent(pluginParams)}#${encodeURIComponent(wsNodeName)}`;
+                links.push(link);
+            }
+        } else {
+            // shadowsocks-ws-tls 标准格式
+            const wsNodeName = `${nodeName}-${port}-SS-WS-TLS`;
+            const ssConfig = `${method}:${user}`;
+            const encodedConfig = btoa(ssConfig);
+            const pluginParams = `v2ray-plugin;mode=websocket;host=${workerDomain};path=${encodeURIComponent(wsPath)};tls;sni=${workerDomain};skip-cert-verify=true`;
+            const link = `ss://${encodedConfig}@${item.ip}:${port}?plugin=${encodeURIComponent(pluginParams)}#${encodeURIComponent(wsNodeName)}`;
+            links.push(link);
+        }
+    });
+    
     return links;
 }
 
