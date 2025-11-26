@@ -319,6 +319,17 @@ export default {
             const userAgent = request.headers.get('User-Agent') || '';
             const url = new URL(request.url);
             
+            // 代理客户端白名单（允许这些客户端进行延迟测试）
+            const proxyClientKeywords = [
+                'v2ray', 'v2rayn', 'xray', 'sing-box', 'clash', 'surge',
+                'go-http-client', 'okhttp', 'java', 'httpclient'
+            ];
+            
+            // 检查是否是代理客户端的请求
+            const isProxyClient = proxyClientKeywords.some(keyword => 
+                userAgent.toLowerCase().includes(keyword.toLowerCase())
+            );
+            
             // 爬虫检测关键词列表
             const botKeywords = [
                 'bot', 'crawler', 'spider', 'scraper', 'crawl', 'fetch',
@@ -334,16 +345,18 @@ export default {
                 'bytespider', 'yandex', 'semrush', 'ahrefs', 'mj12',
                 'dotbot', 'blexbot', 'petalbot', 'lighthouse', 'headless',
                 'phantom', 'selenium', 'webdriver', 'puppeteer', 'playwright',
-                'curl', 'wget', 'python-requests', 'go-http-client', 'java',
-                'httpclient', 'okhttp', 'scrapy', 'mechanize', 'urllib',
+                'curl', 'wget', 'python-requests', 'scrapy', 'mechanize', 'urllib',
                 'libwww-perl', 'lwp-trivial', 'masscan', 'nmap', 'nikto',
                 'sqlmap', 'zap', 'burp', 'nessus', 'openvas', 'acunetix',
                 'netsparker', 'appscan', 'qualys', 'rapid7', 'tenable',
-                'security', 'scanner', 'vulnerability', 'penetration', 'test'
+                'security', 'scanner', 'vulnerability', 'penetration'
             ];
             
-            // 检查 User-Agent 是否包含爬虫关键词
-            const isBot = botKeywords.some(keyword => 
+            // 检查是否是来自中国大陆的请求（可能是延迟测试）
+            const isFromChina = request.cf?.country === 'CN';
+            
+            // 检查 User-Agent 是否包含爬虫关键词（排除代理客户端和来自中国大陆的请求）
+            const isBot = !isProxyClient && !isFromChina && botKeywords.some(keyword => 
                 userAgent.toLowerCase().includes(keyword.toLowerCase())
             );
             
