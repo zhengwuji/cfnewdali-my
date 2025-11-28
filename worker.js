@@ -446,7 +446,65 @@ async function checkIPAvailability(domain, port = 443, timeout = 2000) {
     }
 }
 
-async function getBestBackupIP(workerRegion = '') {
+// 测试代理IP的速度（延迟）
+async function testIPLatency(domain, port = 443, timeout = 5000) {
+    try {
+        const startTime = Date.now();
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), timeout);
+        
+        const response = await fetch(`https://${domain}`, {
+            method: 'HEAD',
+            signal: controller.signal,
+            headers: generateRandomHeaders({
+                'User-Agent': generateCheckerUserAgent()
+            })
+        });
+        
+        clearTimeout(timeoutId);
+        const latency = Date.now() - startTime;
+        
+        if (response.status < 500) {
+            return { success: true, latency, domain };
+        } else {
+            return { success: false, latency: timeout, domain };
+        }
+    } catch (error) {
+        return { success: false, latency: timeout, domain };
+    }
+}
+
+// 并行测试多个代理IP的速度，返回最快的IP
+async function getFastestIP(ipList, maxTestCount = 5) {
+    if (!ipList || ipList.length === 0) {
+        return null;
+    }
+    
+    // 限制测试数量，避免测试时间过长
+    const testIPs = ipList.slice(0, maxTestCount);
+    
+    // 并行测试所有IP的速度
+    const testPromises = testIPs.map(ip => testIPLatency(ip.domain, ip.port));
+    const results = await Promise.all(testPromises);
+    
+    // 过滤成功的测试结果，并按延迟排序
+    const successfulResults = results
+        .filter(result => result.success)
+        .sort((a, b) => a.latency - b.latency);
+    
+    if (successfulResults.length === 0) {
+        // 如果没有成功的测试，返回第一个IP
+        return testIPs[0];
+    }
+    
+    // 找到对应的IP对象
+    const fastestDomain = successfulResults[0].domain;
+    const fastestIP = testIPs.find(ip => ip.domain === fastestDomain);
+    
+    return fastestIP || testIPs[0];
+}
+
+async function getBestBackupIP(workerRegion = '', enableSpeedTest = true) {
     
     if (backupIPs.length === 0) {
         return null;
@@ -457,8 +515,24 @@ async function getBestBackupIP(workerRegion = '') {
     if (enableRegionMatching && workerRegion) {
         const sortedIPs = getSmartRegionSelection(workerRegion, availableIPs);
         if (sortedIPs.length > 0) {
+            // 如果启用速度测试，测试并选择最快的IP
+            if (enableSpeedTest) {
+                const fastestIP = await getFastestIP(sortedIPs, 5);
+                if (fastestIP) {
+                    return fastestIP;
+                }
+            }
+            // 如果速度测试失败或未启用，返回优先级最高的IP
             const selectedIP = sortedIPs[0];
             return selectedIP;
+        }
+    }
+    
+    // 如果没有区域匹配或未启用，测试所有IP并选择最快的
+    if (enableSpeedTest && availableIPs.length > 1) {
+        const fastestIP = await getFastestIP(availableIPs, 5);
+        if (fastestIP) {
+            return fastestIP;
         }
     }
     
@@ -1119,6 +1193,7 @@ export default {
             if (url.pathname.length > 1 && (url.pathname.includes('http://') || url.pathname.includes('https://'))) {
                 return await handleProxyRequest(request, url);
             }
+            
 
             if (url.pathname.includes('/api/config')) {
                 const pathParts = url.pathname.split('/').filter(p => p);
@@ -2789,6 +2864,69 @@ async function handleUploadFileAPI(request) {
                     return await handleSubscriptionRequest(request, at);
                 }
             }
+            
+            // 在返回404之前，检查是否是自定义代理路径
+            const customProxyPath = getConfigValue('PROXY_PATH', env.PROXY_PATH || env.proxy_path || '');
+            if (customProxyPath && customProxyPath.trim()) {
+                const proxyPathPattern = customProxyPath.trim();
+                const normalizedPath = url.pathname.endsWith('/') && url.pathname.length > 1 ? url.pathname.slice(0, -1) : url.pathname;
+                const cleanProxyPath = proxyPathPattern.startsWith('/') ? proxyPathPattern.substring(1) : proxyPathPattern;
+                
+                // 检查路径是否匹配代理路径模式（例如：/test/123）
+                if (normalizedPath.startsWith('/' + cleanProxyPath + '/')) {
+                    // 提取代理目标URL（路径中 /test/ 之后的部分）
+                    const targetPath = normalizedPath.substring(cleanProxyPath.length + 2); // +2 因为要去掉开头的 '/' 和 'test/'
+                    if (targetPath) {
+                        // 直接跳转到代理访问
+                        return await handleProxyRequest(request, new URL(url.origin + '/' + targetPath));
+                    }
+                }
+                
+                // 如果路径正好是代理路径（如 /test），且不是订阅路径，返回只显示代理访问功能的页面
+                if (normalizedPath === '/' + cleanProxyPath) {
+                    // 确保不是订阅路径
+                    const isSubscriptionPath = (cp && cp.trim() && normalizedPath === '/' + (cp.trim().startsWith('/') ? cp.trim().substring(1) : cp.trim())) ||
+                                               (normalizedPath === '/' + at);
+                    if (!isSubscriptionPath) {
+                        return await handleProxyOnlyPage(request, url);
+                    }
+                }
+            }
+            
+            // 检查是否是根路径下的直接代理路径（如 /111）
+            // 如果路径不是订阅路径，也不是API路径，且不是根路径，则可能是代理路径
+            if (url.pathname.length > 1 && 
+                !url.pathname.includes('/api/') && 
+                !url.pathname.includes('/sub') &&
+                url.pathname !== '/' &&
+                !url.pathname.startsWith('/file/') &&
+                url.pathname !== '/bg-image' &&
+                url.pathname !== '/background-image' &&
+                url.pathname !== '/favicon.ico' &&
+                !url.pathname.endsWith('/region') &&
+                !url.pathname.endsWith('/test-api') &&
+                !url.pathname.includes('/__test__')) {
+                // 检查是否是有效的代理路径（不是UUID格式，也不是已知的路径）
+                const pathSegment = url.pathname.substring(1).split('/')[0];
+                const normalizedPath = url.pathname.endsWith('/') && url.pathname.length > 1 ? url.pathname.slice(0, -1) : url.pathname;
+                
+                // 如果不是订阅路径，也不是UUID格式，则可能是代理路径
+                if (!isValidFormat(pathSegment) && 
+                    normalizedPath !== '/' + (cp || at) &&
+                    !normalizedPath.startsWith('/' + (cp || at) + '/')) {
+                    // 可能是代理路径，尝试作为代理请求处理
+                    const targetPath = url.pathname.substring(1);
+                    if (targetPath && !targetPath.includes('http://') && !targetPath.includes('https://')) {
+                        // 尝试作为代理请求处理
+                        try {
+                            return await handleProxyRequest(request, new URL(url.origin + '/' + targetPath));
+                        } catch (e) {
+                            // 如果失败，继续正常流程
+                        }
+                    }
+                }
+            }
+            
             return new Response(JSON.stringify({ error: 'Not Found' }), { 
                 status: 404,
                 headers: { 'Content-Type': 'application/json' }
@@ -3869,6 +4007,9 @@ async function handleSubscriptionPage(request, user = null) {
                 enableShadowsocks: '启用 Shadowsocks-WS-TLS 协议',
                 trojanPassword: 'Trojan 密码 (可选):',
                 customPath: '自定义路径 (d):',
+                customProxyPath: '自定义代理路径 (PROXY_PATH):',
+                customProxyPathPlaceholder: '例如: test',
+                customProxyPathHint: '设置自定义代理路径。访问该路径下的子路径时，将直接跳转到代理访问功能。例如：设置 test 后，访问 /test/123 将直接代理访问 123 这个URL。',
                 customIP: '自定义ProxyIP (p):',
                 preferredIPs: '优选IP列表 (yx):',
                 preferredIPsURL: '优选IP来源URL (yxURL):',
@@ -4554,6 +4695,14 @@ async function handleSubscriptionPage(request, user = null) {
                     <small id="proxyHintText" style="color: #ffffff; font-weight: bold; font-size: 0.85rem; display: block; margin-top: 8px; -webkit-font-smoothing: subpixel-antialiased; -moz-osx-font-smoothing: auto; text-rendering: geometricPrecision; text-shadow: none; opacity: 1;">在网址后输入目标网站，例如: /github.com 或 /https://github.com</small>
                 </div>
             </form>
+            <div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid rgba(255, 255, 255, 0.3);">
+                <div style="margin-bottom: 15px;">
+                    <label style="display: block; margin-bottom: 8px; color: #ffffff; font-weight: bold; text-shadow: none; -webkit-font-smoothing: subpixel-antialiased; -moz-osx-font-smoothing: auto; text-rendering: geometricPrecision;">${t.customProxyPath}</label>
+                    <input type="text" id="customProxyPath" placeholder="${t.customProxyPathPlaceholder}" style="width: 100%; padding: 12px; background: rgba(0, 0, 0, 0.6); border: 1px solid #ffffff; border-radius: 8px; color: #ffffff; font-weight: bold; font-family: 'Courier New', monospace; font-size: 14px; -webkit-font-smoothing: subpixel-antialiased; -moz-osx-font-smoothing: auto; text-rendering: geometricPrecision; backdrop-filter: blur(10px);">
+                    <small style="color: #ffffff; font-weight: bold; font-size: 0.85rem; -webkit-font-smoothing: subpixel-antialiased; -moz-osx-font-smoothing: auto; text-rendering: geometricPrecision; text-shadow: none; opacity: 1; display: block; margin-top: 8px;">${t.customProxyPathHint}</small>
+                </div>
+                <button type="button" id="saveProxyPathBtn" style="background: rgba(0, 0, 0, 0.6); border: 1px solid #ffffff; border-radius: 8px; padding: 12px 24px; color: #ffffff; font-weight: bold; font-family: 'Courier New', monospace; font-weight: bold; cursor: pointer; text-shadow: none; transition: all 0.4s ease; -webkit-font-smoothing: subpixel-antialiased; -moz-osx-font-smoothing: auto; text-rendering: geometricPrecision; opacity: 1; backdrop-filter: blur(10px); box-shadow: 0 2px 10px rgba(0, 0, 0, 0.3); width: 100%;">保存代理路径配置</button>
+            </div>
             <div style="margin-top: 15px; text-align: center;">
                 <button id="testButton" onclick="openTestPage()" style="padding: 12px 24px; background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%); border: none; border-radius: 8px; color: white; font-weight: bold; font-family: 'Courier New', monospace; cursor: pointer; text-shadow: none; transition: all 0.4s ease; backdrop-filter: blur(10px); box-shadow: 0 4px 15px rgba(79, 172, 254, 0.3); white-space: nowrap; width: 100%;">🔍 检测代理信息隐藏状态</button>
             </div>
@@ -4635,6 +4784,50 @@ async function handleSubscriptionPage(request, user = null) {
             if (hintText) {
                 var currentOrigin = window.location.origin;
                 hintText.textContent = '在网址后输入目标网站，例如: ' + currentOrigin + '/github.com 或 ' + currentOrigin + '/https://github.com';
+            }
+        })();
+
+        // 保存代理路径配置
+        (function() {
+            var saveProxyPathBtn = document.getElementById('saveProxyPathBtn');
+            if (saveProxyPathBtn) {
+                saveProxyPathBtn.addEventListener('click', async function(e) {
+                    e.preventDefault();
+                    var customProxyPath = document.getElementById('customProxyPath');
+                    if (!customProxyPath) return;
+                    
+                    var proxyPathValue = customProxyPath.value.trim();
+                    var configData = { PROXY_PATH: proxyPathValue };
+                    
+                    // 使用saveConfig函数保存配置
+                    if (typeof saveConfig === 'function') {
+                        try {
+                            await saveConfig(configData);
+                            alert('代理路径配置已保存');
+                        } catch (error) {
+                            alert('保存失败: ' + (error.message || '未知错误'));
+                        }
+                    } else {
+                        // 如果saveConfig函数不存在，直接调用API
+                        try {
+                            const apiUrl = window.location.pathname + '/api/config';
+                            const response = await fetch(apiUrl, {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify(configData)
+                            });
+                            
+                            if (response.ok) {
+                                alert('代理路径配置已保存');
+                            } else {
+                                const errorText = await response.text();
+                                alert('保存失败: ' + errorText);
+                            }
+                        } catch (error) {
+                            alert('保存失败: ' + (error.message || '未知错误'));
+                        }
+                    }
+                });
             }
         })();
 
@@ -5573,6 +5766,7 @@ async function handleSubscriptionPage(request, user = null) {
                 if (document.getElementById('ispUnicom')) document.getElementById('ispUnicom').checked = config.ispUnicom !== 'no';
                 if (document.getElementById('ispTelecom')) document.getElementById('ispTelecom').checked = config.ispTelecom !== 'no';
                 document.getElementById('customPath').value = config.d || '';
+                document.getElementById('customProxyPath').value = config.PROXY_PATH || config.proxy_path || '';
                 document.getElementById('customIP').value = config.p || '';
                 document.getElementById('preferredIPs').value = config.yx || '';
                 document.getElementById('preferredIPsURL').value = config.yxURL || '';
@@ -5854,6 +6048,7 @@ async function handleSubscriptionPage(request, user = null) {
                     e.preventDefault();
                     const configData = { ev: document.getElementById('ev').checked ? 'yes' : 'no', et: document.getElementById('et').checked ? 'yes' : 'no', ex: document.getElementById('ex').checked ? 'yes' : 'no', es: document.getElementById('es').checked ? 'yes' : 'no', tp: document.getElementById('tp').value,
                         d: document.getElementById('customPath').value,
+                        PROXY_PATH: document.getElementById('customProxyPath').value,
                         p: document.getElementById('customIP').value,
                         yx: document.getElementById('preferredIPs').value,
                         yxURL: document.getElementById('preferredIPsURL').value,
@@ -5938,6 +6133,7 @@ async function handleSubscriptionPage(request, user = null) {
                                 es: document.getElementById('es').checked ? 'yes' : 'no',
                                 tp: document.getElementById('tp').value,
                                 d: document.getElementById('customPath').value,
+                                PROXY_PATH: document.getElementById('customProxyPath').value,
                                 p: document.getElementById('customIP').value,
                                 yx: document.getElementById('preferredIPs').value,
                                 yxURL: document.getElementById('preferredIPsURL').value,
@@ -6032,6 +6228,7 @@ async function handleSubscriptionPage(request, user = null) {
                                 es: document.getElementById('es').checked ? 'yes' : 'no',
                                 tp: document.getElementById('tp').value,
                                 d: document.getElementById('customPath').value,
+                                PROXY_PATH: document.getElementById('customProxyPath').value,
                                 p: document.getElementById('customIP').value,
                                 yx: document.getElementById('preferredIPs').value,
                                 yxURL: document.getElementById('preferredIPsURL').value,
@@ -8014,6 +8211,95 @@ function generateTestPageHTML(headersJson, workerHostJson) {
 }
 
 // 处理测试页面请求
+async function handleProxyOnlyPage(request, url) {
+    const langAttr = 'zh-CN';
+    const currentOrigin = url.origin;
+    
+    const proxyOnlyHtml = `<!DOCTYPE html>
+    <html lang="${langAttr}" dir="ltr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>代理访问</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: "Courier New", monospace;
+            font-weight: bold;
+            background: #000 url('/bg-image') center center / cover no-repeat fixed;
+            color: #ffffff; font-weight: bold; min-height: 100vh;
+            overflow-x: hidden; position: relative;
+            display: flex; justify-content: center; align-items: center;
+        }
+        .container { max-width: 600px; margin: 0 auto; padding: 20px; position: relative; z-index: 1; width: 100%; }
+        .card {
+            background: rgba(0, 0, 0, 0.6);
+            border: 1px solid #ffffff;
+            border-radius: 12px; padding: 30px; margin-bottom: 20px;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+            backdrop-filter: blur(10px);
+        }
+        .card-title {
+            font-size: 1.8rem; margin-bottom: 20px;
+            color: #ffffff; font-weight: bold; text-align: center;
+        }
+        input[type="text"] {
+            width: 100%; padding: 12px; background: rgba(0, 0, 0, 0.6);
+            border: 1px solid #ffffff; border-radius: 8px; color: #ffffff;
+            font-weight: bold; font-family: "Courier New", monospace; font-size: 14px;
+            margin-bottom: 10px;
+        }
+        button {
+            padding: 12px 24px; background: rgba(0, 0, 0, 0.6);
+            border: 1px solid #ffffff; border-radius: 8px; color: #ffffff;
+            font-weight: bold; font-family: "Courier New", monospace;
+            cursor: pointer; transition: all 0.4s ease; width: 100%;
+        }
+        button:hover {
+            background: rgba(0, 0, 0, 0.7);
+            box-shadow: 0 4px 20px rgba(255, 255, 255, 0.2);
+        }
+        small {
+            color: #ffffff; font-weight: bold; font-size: 0.85rem; display: block; margin-top: 8px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="card">
+            <h2 class="card-title">代理访问</h2>
+            <form id="urlForm" onsubmit="redirectToProxy(event)" style="margin: 20px 0;">
+                <div style="margin-bottom: 15px;">
+                    <label for="targetUrl" style="display: block; margin-bottom: 8px; color: #ffffff; font-weight: bold;">目标网址:</label>
+                    <input type="text" id="targetUrl" placeholder="输入要访问的网址，例如: github.com 或 https://github.com">
+                    <button type="submit" id="jumpButton">跳转</button>
+                    <small id="proxyHintText">在网址后输入目标网站，例如: ${currentOrigin}/github.com 或 ${currentOrigin}/https://github.com</small>
+                </div>
+            </form>
+        </div>
+    </div>
+    <script>
+        function redirectToProxy(event) {
+            event.preventDefault();
+            var targetUrl = document.getElementById('targetUrl').value.trim();
+            if (!targetUrl) {
+                alert('请输入目标网址');
+                return;
+            }
+            var currentOrigin = window.location.origin;
+            var proxyUrl = currentOrigin + '/' + targetUrl;
+            window.open(proxyUrl, '_blank');
+        }
+    </script>
+</body>
+</html>`;
+    
+    return new Response(proxyOnlyHtml, {
+        status: 200,
+        headers: { 'Content-Type': 'text/html; charset=utf-8' }
+    });
+}
+
 async function handleTestPage(request, url) {
     // 模拟一个目标网站URL用于测试
     const testTargetUrl = "https://example.com";
@@ -8136,6 +8422,23 @@ async function handleProxyRequest(request, url) {
     
     // 调试：记录 Cookie 信息
     // console.log('Client Cookies:', siteCookie);
+    
+    // 根据用户所在国家优选最快的代理IP
+    try {
+        const userCountry = request.cf?.country || '';
+        const userRegion = await detectWorkerRegion(request);
+        
+        // 根据用户国家选择最优的代理IP（测试速度并选择最快的）
+        const bestProxyIP = await getBestBackupIP(userRegion, true);
+        
+        if (bestProxyIP) {
+            // 记录选择的代理IP信息（可用于日志或调试）
+            // console.log(`[代理访问] 用户国家: ${userCountry}, 选择区域: ${userRegion}, 最优代理IP: ${bestProxyIP.domain}`);
+        }
+    } catch (error) {
+        // 如果选择代理IP失败，继续使用默认方式
+        // console.log('[代理访问] 选择代理IP时出错:', error);
+    }
     
     // 处理 favicon 和 robots.txt
     if (request.url.endsWith("favicon.ico")) {
