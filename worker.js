@@ -2367,8 +2367,27 @@ async function handleUploadFileAPI(request) {
                         invading: '正在入侵...',
                         success: '连接成功！返回结果...',
                         error: '错误: 无效的UUID格式',
-                        reenter: '请重新输入有效的UUID'
+                        reenter: '请重新输入有效的UUID',
+                        blocked: '超过三次没有30分钟后再尝试，禁止暴力尝试'
                     };
+                
+                // 检查是否在禁止期内
+                const blockUntil = localStorage.getItem('uuidBlockUntil');
+                if (blockUntil) {
+                    const blockTime = parseInt(blockUntil, 10);
+                    const now = Date.now();
+                    if (now < blockTime) {
+                        const remainingMinutes = Math.ceil((blockTime - now) / (1000 * 60));
+                        addTerminalLine(t.blocked, 'error');
+                        addTerminalLine('请等待 ' + remainingMinutes + ' 分钟后再试', 'error');
+                        input.value = '';
+                        return;
+                    } else {
+                        // 禁止期已过，清除记录
+                        localStorage.removeItem('uuidBlockUntil');
+                        localStorage.removeItem('uuidFailCount');
+                    }
+                }
                 
                 if (cp) {
                     const cleanInput = inputValue.startsWith('/') ? inputValue : '/' + inputValue;
@@ -2379,6 +2398,8 @@ async function handleUploadFileAPI(request) {
                             window.location.href = cleanInput;
                         }, 1000);
                     }, 500);
+                    // 成功时清除失败计数
+                    localStorage.removeItem('uuidFailCount');
                 } else {
                     if (isValidUUID(inputValue)) {
                         addTerminalLine(t.invading, 'output');
@@ -2388,9 +2409,26 @@ async function handleUploadFileAPI(request) {
                                 window.location.href = '/' + inputValue;
                         }, 1000);
                     }, 500);
+                    // 成功时清除失败计数
+                    localStorage.removeItem('uuidFailCount');
                 } else {
                         addTerminalLine(t.error, 'error');
                         addTerminalLine(t.reenter, 'output');
+                        
+                        // 记录失败次数
+                        let failCount = parseInt(localStorage.getItem('uuidFailCount') || '0', 10);
+                        failCount++;
+                        localStorage.setItem('uuidFailCount', failCount.toString());
+                        
+                        // 如果连续三次失败，设置30分钟禁止期
+                        if (failCount >= 3) {
+                            const blockUntil = Date.now() + (30 * 60 * 1000); // 30分钟后
+                            localStorage.setItem('uuidBlockUntil', blockUntil.toString());
+                            addTerminalLine(t.blocked, 'error');
+                            addTerminalLine('请等待 30 分钟后再试', 'error');
+                            // 重置失败计数
+                            localStorage.removeItem('uuidFailCount');
+                        }
                     }
                 }
                 
@@ -3011,16 +3049,16 @@ async function recordSubscriptionUsage(request, target) {
             statsData = {};
         }
         
-        // 使用唯一ID作为key，确保每个IP+客户端类型组合都有独立记录
-        // 格式：IP_客户端类型_时间戳（用于区分同一IP同一客户端的不同访问）
-        // 但为了节省空间，我们仍然使用 IP_客户端类型 作为key，只更新最后访问时间
-        const clientKey = `${clientIP}_${clientType}`;
+        // 使用IP作为唯一key，确保每个IP只记录一次，不重复记录
+        // 如果同一IP使用不同客户端类型，只更新最后访问时间和客户端信息
+        const clientKey = clientIP;
+        const existingRecord = statsData[clientKey];
         const clientRecord = {
             ip: clientIP,
             client: clientType,
             lastAccess: timestamp,
             userAgent: userAgent.length > 100 ? userAgent.substring(0, 100) : userAgent,
-            firstAccess: statsData[clientKey]?.firstAccess || timestamp // 保留首次访问时间
+            firstAccess: existingRecord?.firstAccess || timestamp // 保留首次访问时间
         };
         
         statsData[clientKey] = clientRecord;
